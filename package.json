@@ -3,13 +3,28 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": [
+    "twitter",
+    "bot",
+    "blockchain",
+    "verification",
+    "web3"
+  ],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "A Twitter bot that verifies tweets using on-chain sources",
   "dependencies": {
-    "express": "^5.1.0"
+    "@google/generative-ai": "^0.2.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.0",
+    "ethers": "^6.8.0",
+    "express": "^5.1.0",
+    "graphql-request": "^6.1.0",
+    "nodemon": "^3.1.10",
+    "twitter-api-v2": "^1.15.0"
   }
 }
