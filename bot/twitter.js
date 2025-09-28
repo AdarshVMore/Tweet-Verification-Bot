@@ -71,8 +71,6 @@ class TwitterBot {
         throw new Error('Manual tweet text is required when tweet fetching is disabled');
       }
 
-      console.log("Using manual tweet text:", manualTweetText);
-
       // Create a mock tweet structure for manual input
       const mockTweetData = {
         data: {
@@ -108,10 +106,10 @@ class TwitterBot {
       throw new Error(`Failed to process tweet: ${error.message}`);
     }
   }
-
+ 
   async getTweetsByUser(username, count = 10) {
     try {
-      const user = await this.retryWithBackoff(async () => {
+      const user = await this.retryWithBackoff(async() => {
         return await this.bearerClient.v2.userByUsername(username);
       }, this.rateLimitRetries);
 

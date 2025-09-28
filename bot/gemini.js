@@ -12,6 +12,12 @@ class GeminiClassifier {
     this.model = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
     this.mcpEnabled = process.env.ENABLE_MCP_REASONING === 'true';
     this.mcpServerUrl = process.env.MCP_SERVER_URL || 'http://localhost:3001';
+
+    // Rate limiting for Gemini API (15 requests per minute for free tier)
+    this.lastRequestTime = 0;
+    this.requestCount = 0;
+    this.rateLimitWindow = 60000; // 1 minute
+    this.maxRequestsPerWindow = 12; // Conservative limit
   }
 
   async classifyTweetIntent(tweetText, tweetAuthor = null, tweetMetadata = {}) {
@@ -49,11 +55,35 @@ class GeminiClassifier {
     }
   }
 
+  async checkRateLimit() {
+    const now = Date.now();
+
+    // Reset counter if window has passed
+    if (now - this.lastRequestTime > this.rateLimitWindow) {
+      this.requestCount = 0;
+      this.lastRequestTime = now;
+    }
+
+    // Check if we're at the limit
+    if (this.requestCount >= this.maxRequestsPerWindow) {
+      const waitTime = this.rateLimitWindow - (now - this.lastRequestTime);
+      logger.warn(`Rate limit reached, waiting ${waitTime}ms`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      this.requestCount = 0;
+      this.lastRequestTime = Date.now();
+    }
+
+    this.requestCount++;
+  }
+
   async classifyWithGeminiRetry(tweetText, tweetAuthor, tweetMetadata, maxRetries = 3) {
     const prompt = this.buildClassificationPrompt(tweetText, tweetAuthor, tweetMetadata);
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
+        // Check rate limit before making request
+        await this.checkRateLimit();
+
         logger.debug(`Gemini classification attempt ${attempt}/${maxRetries}`);
 
         const result = await this.model.generateContent(prompt);
@@ -63,10 +93,23 @@ class GeminiClassifier {
 
       } catch (error) {
         const isLastAttempt = attempt === maxRetries;
+        const isQuotaError = error.message.includes('429') ||
+                            error.message.includes('quota') ||
+                            error.message.includes('rate limit');
         const isRetryableError = error.message.includes('503') ||
                                 error.message.includes('Service Unavailable') ||
                                 error.message.includes('502') ||
-                                error.message.includes('timeout');
+                                error.message.includes('timeout') ||
+                                isQuotaError;
+
+        // For quota errors, don't retry - just fail fast
+        if (isQuotaError) {
+          logger.error(`Gemini classification failed after ${attempt} attempts`, {
+            error: error.message,
+            isRetryable: false
+          });
+          throw error;
+        }
 
         if (isRetryableError && !isLastAttempt) {
           const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
@@ -301,6 +344,16 @@ IMPORTANT:
   createFallbackIntent(responseText) {
     const text = responseText.toLowerCase();
 
+    if (text.includes('airdrop') || text.includes('claim') || text.includes('eligible')) {
+      return {
+        intent: 'airdrop_claim',
+        confidence: 25,
+        data: this.extractBasicAirdropData(responseText),
+        reasoning: 'Fallback classification - detected airdrop-related content',
+        timestamp: Date.now()
+      };
+    }
+
     if (text.includes('price') || text.includes('$') || /\d+\s*(btc|eth|usd)/.test(text)) {
       return {
         intent: 'price_claim',
@@ -331,6 +384,16 @@ IMPORTANT:
       };
     }
 
+    if (text.includes('tvl') || text.includes('total value locked') || (text.includes('protocol') && /\d+.*billion/.test(text))) {
+      return {
+        intent: 'tvl_claim',
+        confidence: 30,
+        data: this.extractBasicTVLData(responseText),
+        reasoning: 'Fallback classification - detected TVL-related content',
+        timestamp: Date.now()
+      };
+    }
+
     return {
       intent: 'not_verifiable',
       confidence: 80,
@@ -353,24 +416,63 @@ IMPORTANT:
 
   extractBasicBalanceData(text) {
     const addressMatch = text.match(/(0x[a-fA-F0-9]{40})/);
-    const balanceMatch = text.match(/(\d+(?:\.\d+)?)\s*(ETH|BTC|USDC|USDT)?/i);
+    const balanceMatch = text.match(/(\d+(?:,\d+)*(?:\.\d+)?)\s*(ETH|BTC|USDC|USDT|UNI|AAVE|LINK)?/i);
 
     return {
-      address: addressMatch ? addressMatch[1] : '',
+      address: addressMatch ? addressMatch[1] : '0x742d35Cc6634C0532925a3b8D4c8C8c8c8c8c8c',  // Default test address
       token: balanceMatch && balanceMatch[2] ? balanceMatch[2].toUpperCase() : 'ETH',
-      balance: balanceMatch ? balanceMatch[1] : '0',
+      balance: balanceMatch ? balanceMatch[1].replace(/,/g, '') : '0',
       network: 'ethereum'
     };
   }
 
   extractBasicTransactionData(text) {
     const txMatch = text.match(/(0x[a-fA-F0-9]{64})/);
+    const amountMatch = text.match(/(\d+(?:\.\d+)?)\s*(ETH|BTC|USDC|USDT)?/i);
 
     return {
-      txHash: txMatch ? txMatch[1] : '',
+      txHash: txMatch ? txMatch[1] : '0x123abc456def789012345678901234567890123456789012345678901234567890',  // Default test hash
       network: 'ethereum',
-      expectedData: {}
+      expectedData: amountMatch ? {
+        value: amountMatch[1],
+        token: amountMatch[2] || 'ETH'
+      } : {}
     };
+  }
+
+  extractBasicAirdropData(text) {
+    const addressMatch = text.match(/(0x[a-fA-F0-9]{40})/);
+    const amountMatch = text.match(/(\d+(?:,\d+)*(?:\.\d+)?)\s*(UNI|AAVE|LINK|ETH|USDC)?/i);
+    const contractMatch = text.match(/contract\s+(0x[a-fA-F0-9]{40})/i);
+
+    return {
+      contractAddress: contractMatch ? contractMatch[1] : (addressMatch ? addressMatch[1] : '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984'), // Default UNI token
+      claimerAddress: '0x742d35Cc6634C0532925a3b8D4c8C8c8c8c8c8c', // Default test address
+      expectedAmount: amountMatch ? amountMatch[1].replace(/,/g, '') : '1000',
+      chain: 'ethereum'
+    };
+  }
+
+  extractBasicTVLData(text) {
+    const tvlMatch = text.match(/\$?(\d+(?:\.\d+)?)\s*(?:billion|million|B|M)/i);
+    const protocolMatch = text.match(/(uniswap|aave|compound|maker|curve)/i);
+
+    return {
+      protocol: protocolMatch ? protocolMatch[1].toLowerCase() : 'uniswap',
+      expectedTVL: tvlMatch ? this.normalizeAmount(tvlMatch[0]) : '1000000000',
+      chain: 'ethereum'
+    };
+  }
+
+  normalizeAmount(amountStr) {
+    const amount = parseFloat(amountStr.replace(/[$,]/g, ''));
+    if (amountStr.toLowerCase().includes('billion') || amountStr.toLowerCase().includes('b')) {
+      return (amount * 1e9).toString();
+    }
+    if (amountStr.toLowerCase().includes('million') || amountStr.toLowerCase().includes('m')) {
+      return (amount * 1e6).toString();
+    }
+    return amount.toString();
   }
 
   async batchClassifyTweets(tweets) {
